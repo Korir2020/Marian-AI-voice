@@ -6,7 +6,18 @@ import { config } from "./config.js";
 
 const app = express();
 app.disable("x-powered-by");
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        "script-src": ["'self'", "'unsafe-inline'", "blob:", "data:", "https://esm.sh"],
+        "connect-src": ["'self'", "https://esm.sh", "https://generativelanguage.googleapis.com", "wss://generativelanguage.googleapis.com"],
+        "worker-src": ["'self'", "blob:", "data:"],
+        "media-src": ["'self'", "blob:", "data:"],
+      },
+    },
+  })
+);
 app.use(express.json({ limit: "32kb" }));
 app.use(cors({
   origin(origin, callback) {
