@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marian</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#111; color:#eee;
+         display:flex; flex-direction:column; height:100dvh; }
+  header { padding:16px; text-align:center; }
+  #status { color:#9a9; font-size:14px; min-height:1.2em; }
+  #mem { padding:0 16px 8px; font-size:14px; }
+  #mem label { display:block; margin-bottom:6px; }
+  #memList { max-height:30vh; overflow-y:auto; margin-top:6px; }
+  .memrow { display:flex; justify-content:space-between; gap:8px; align-items:center; padding:4px 0; }
+  #log { flex:1; overflow-y:auto; padding:0 16px; }
+  .me { color:#8ab4f8; margin:8px 0; }
+  .marian { color:#f1f1f1; margin:8px 0; }
+  footer { padding:16px; text-align:center; }
+  button { font-size:18px; padding:16px 40px; border-radius:40px; border:0;
+           background:#34a853; color:#fff; }
+  button.on { background:#d93025; }
+  button.small { font-size:13px; padding:6px 14px; background:#3c4043; }
+</style>
+</head>
+<body>
+<header><h2>Marian</h2><div id="status">Tap to start. Headphones work best.</div></header>
+<div id="mem">
+  <label><input type="checkbox" id="memOn"> Let Marian remember things about me</label>
+  <button id="memShow" class="small">What she remembers</button>
+  <div id="memList" hidden></div>
+</div>
+<div id="log"></div>
+<footer><button id="btn">Talk to Marian</button></footer>
+
+<script type="module">
+import { GoogleGenAI } from "https://esm.sh/@google/genai";
+
+const btn = document.getElementById("btn");
+const statusEl = document.getElementById("status");
+const log = document.getElementById("log");
+
+let session, micCtx, outCtx, stream, node, nextTime = 0, running = false;
+const sources = new Set();
+let lastRole = null, lastEl = null;
+const transcript = [];
+
+const setStatus = (t) => (statusEl.textContent = t);
+
+// ---------- memory (opt-in) ----------
+const deviceId = (() => {
+  try {
+    let d = localStorage.getItem("marianDevice");
+    if (!d) { d = crypto.randomUUID(); localStorage.setItem("marianDevice", d); }
+    return d;
+  } catch { return "anon-" + Math.random().toString(36).slice(2) + "00000000"; }
+})();
+const memOnEl = document.getElementById("memOn");
+try { memOnEl.checked = localStorage.getItem("marianMem") === "1"; } catch {}
+const memoryOn = () => memOnEl.checked;
+memOnEl.onchange = () => { try { localStorage.setItem("marianMem", memoryOn() ? "1" : "0"); } catch {} };
+const memHeaders = () => ({
+  "Content-Type": "application/json",
+  "X-Device-Id": deviceId,
+  "X-Memory": memoryOn() ? "on" : "off",
+});
+
+async function renderMemories() {
+  const box = document.getElementById("memList");
+  box.replaceChildren();
+  try {
+    const r = await fetch("/api/memory", { headers: memHeaders() });
+    const d = await r.json();
+    const list = d.memories || [];
+    if (!list.length) { box.textContent = "Nothing yet."; return; }
+    for (const m of list) {
+      const row = document.createElement("div");
+      row.className = "memrow";
+      const t = document.createElement("span");
+      t.textContent = m.text;
+      const x = document.createElement("button");
+      x.className = "small";
+      x.textContent = "Forget";
+      x.onclick = async () => {
+        await fetch("/api/memory/" + m.id, { method: "DELETE", headers: memHeaders() });
+        renderMemories();
+      };
+      row.append(t, x);
+      box.append(row);
+    }
+    const all = document.createElement("button");
+    all.className = "small";
+    all.textContent = "Forget everything";
+    all.onclick = async () => {
+      await fetch("/api/memory", { method: "DELETE", headers: memHeaders() });
+      renderMemories();
+    };
+    box.append(all);
+  } catch { box.textContent = "Could not load memories."; }
+}
+document.getElementById("memShow").onclick = () => {
+  const box = document.getElementById("memList");
+  box.hidden = !box.hidden;
+  if (!box.hidden) renderMemories();
+};
+
+async function learn() {
+  const t = transcript.splice(0);
+  if (!memoryOn() || t.length < 2) return;
+  try {
+    await fetch("/api/memory/learn", {
+      method: "POST", headers: memHeaders(), keepalive: true,
+      body: JSON.stringify({ transcript: t }),
+    });
+    if (!document.getElementById("memList").hidden) renderMemories();
+  } catch {}
+}
+
+// ---------- transcript ----------
+function addText(role, text) {
+  if (!text) return;
+  const prev = transcript[transcript.length - 1];
+  if (prev && prev.role === role) prev.text += text; else transcript.push({ role, text });
+  if (role !== lastRole) {
+    lastEl = document.createElement("div");
+    lastEl.className = role;
+    lastEl.textContent = (role === "me" ? "You: " : "Marian: ");
+    log.appendChild(lastEl);
+    lastRole = role;
+  }
+  lastEl.textContent += text;
+  log.scrollTop = log.scrollHeight;
+}
+
+// ---------- audio ----------
+const toB64 = (buf) => {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 4096)
+    s += String.fromCharCode(...bytes.subarray(i, i + 4096));
+  return btoa(s);
+};
+
+function play(b64) {
+  const bin = atob(b64);
+  const n = bin.length / 2;
+  const f32 = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(i * 2) | (bin.charCodeAt(i * 2 + 1) << 8);
+    if (v >= 0x8000) v -= 0x10000;
+    f32[i] = v / 0x8000;
+  }
+  const buf = outCtx.createBuffer(1, n, 24000);
+  buf.copyToChannel(f32, 0);
+  const src = outCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(outCtx.destination);
+  nextTime = Math.max(nextTime, outCtx.currentTime);
+  src.start(nextTime);
+  nextTime += buf.duration;
+  sources.add(src);
+  src.onended = () => sources.delete(src);
+}
+
+// Barge-in: the user spoke over Marian, so cut her audio immediately.
+function stopPlayback() {
+  sources.forEach((s) => { try { s.stop(); } catch {} });
+  sources.clear();
+  nextTime = 0;
+}
+
+const workletCode = `
+class PCM extends AudioWorkletProcessor {
+  constructor(){ super(); this.buf = new Float32Array(2048); this.n = 0; }
+  process(inputs){
+    const ch = inputs[0][0];
+    if (ch) for (let i = 0; i < ch.length; i++) {
+      this.buf[this.n++] = ch[i];
+      if (this.n === this.buf.length) {
+        const out = new Int16Array(this.n);
+        for (let j = 0; j < this.n; j++) {
+          const s = Math.max(-1, Math.min(1, this.buf[j]));
+          out[j] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        this.port.postMessage(out.buffer, [out.buffer]);
+        this.n = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("pcm", PCM);`;
+
+// ---------- call ----------
+async function start() {
+  setStatus("Connecting...");
+  const r = await fetch("/api/live/session", { method: "POST", headers: memHeaders() });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || "Session failed");
+
+  const ai = new GoogleGenAI({ apiKey: data.token, httpOptions: { apiVersion: "v1beta" } });
+  outCtx = new AudioContext({ sampleRate: 24000 });
+  await outCtx.resume();
+
+  session = await ai.live.connect({
+    model: data.model,
+    config: data.config,
+    callbacks: {
+      onopen: () => setStatus("Listening..."),
+      onmessage: (m) => {
+        const sc = m.serverContent;
+        if (!sc) return;
+        if (sc.interrupted) stopPlayback();
+        for (const p of sc.modelTurn?.parts ?? [])
+          if (p.inlineData?.data) play(p.inlineData.data);
+        addText("me", sc.inputTranscription?.text);
+        addText("marian", sc.outputTranscription?.text);
+        if (sc.turnComplete) lastRole = null;
+      },
+      onerror: (e) => setStatus("Error: " + (e.message || "connection problem")),
+      onclose: () => { if (running) stop(); },
+    },
+  });
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  micCtx = new AudioContext({ sampleRate: 16000 });
+  const url = URL.createObjectURL(new Blob([workletCode], { type: "text/javascript" }));
+  await micCtx.audioWorklet.addModule(url);
+  node = new AudioWorkletNode(micCtx, "pcm");
+  node.port.onmessage = (e) =>
+    session.sendRealtimeInput({ audio: { data: toB64(e.data), mimeType: "audio/pcm;rate=16000" } });
+  micCtx.createMediaStreamSource(stream).connect(node);
+}
+
+function stop() {
+  running = false;
+  learn();
+  try { session?.close(); } catch {}
+  stream?.getTracks().forEach((t) => t.stop());
+  micCtx?.close(); outCtx?.close();
+  stopPlayback();
+  btn.textContent = "Talk to Marian";
+  btn.classList.remove("on");
+  setStatus("Ended. Tap to talk again.");
+}
+
+btn.onclick = async () => {
+  if (running) return stop();
+  running = true;
+  btn.textContent = "End call";
+  btn.classList.add("on");
+  try { await start(); }
+  catch (e) { setStatus("Error: " + e.message); stop(); }
+};
+</script>
+</body>
+</html>
