@@ -65,6 +65,9 @@ app.post("/api/realtime/session", async (_req, res) => {
   }
 });
 
+import { registerGemini } from "./gemini.js";
+registerGemini(app);
+
 app.listen(config.port, "0.0.0.0", () => {
   console.log(`Marian Voice AI backend listening on port ${config.port}`);
 });
