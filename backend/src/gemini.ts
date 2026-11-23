@@ -50,7 +50,7 @@ export function registerGemini(app: Express): void {
             uses: 1,
             expireTime: new Date(now + 30 * 60 * 1000).toISOString(),
             newSessionExpireTime: new Date(now + 60 * 1000).toISOString(),
-            liveConnectConstraints: { model: `models/${MODEL}`, config },
+            bidiGenerateContentSetup: { model: `models/${MODEL}`, generationConfig: { responseModalities: config.responseModalities, speechConfig: config.speechConfig }, systemInstruction: config.systemInstruction, sessionResumption: config.sessionResumption, inputAudioTranscription: config.inputAudioTranscription, outputAudioTranscription: config.outputAudioTranscription },
           }),
         },
       );
